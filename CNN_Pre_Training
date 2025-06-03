@@ -1,0 +1,76 @@
+# This code pre-trains a CNN model for use in transfer learning within a GAN and saves it as a Keras file.
+
+import tensorflow as tf
+from tensorflow.keras import layers, models # type: ignore
+
+# Load and preprocess MNIST data
+(x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
+x_train = x_train / 255.0  # Normalize
+x_test = x_test / 255.0  # Normalize
+x_train = x_train[..., tf.newaxis]  # Add channel dimension
+x_test = x_test[..., tf.newaxis]
+
+# Define data augmentation
+data_augmentation = tf.keras.Sequential([
+    layers.RandomRotation(0.1),
+    layers.RandomTranslation(0.1, 0.1),
+    layers.RandomZoom(0.1),
+])
+
+# Use augmented data for training
+train_dataset = tf.data.Dataset.from_tensor_slices((x_train, y_train))
+train_dataset = (train_dataset
+                 .shuffle(60000)
+                 .map(lambda x, y: (data_augmentation(x), y))
+                 .batch(32)
+                 .prefetch(buffer_size=tf.data.AUTOTUNE))
+
+test_dataset = tf.data.Dataset.from_tensor_slices((x_test, y_test)).batch(32).prefetch(buffer_size=tf.data.AUTOTUNE)
+
+# Define CNN model
+def build_cnn_model():
+    model = models.Sequential([
+        layers.Conv2D(32, (3, 3), activation='relu', input_shape=(28, 28, 1)),
+        layers.BatchNormalization(),
+        layers.MaxPooling2D((2, 2)),
+        layers.Conv2D(64, (3, 3), activation='relu'),
+        layers.BatchNormalization(),
+        layers.MaxPooling2D((2, 2)),
+        layers.Flatten(),
+        layers.Dense(128, activation='relu'),
+        layers.BatchNormalization(),
+        layers.Dense(10, activation='softmax')
+    ])
+    return model
+
+# Define Learning Rate Scheduler
+lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+    initial_learning_rate=1e-3,
+    decay_steps=10000,
+    decay_rate=0.9
+)
+optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+
+# Create and compile model
+cnn_model = build_cnn_model()
+cnn_model.compile(optimizer=optimizer, loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+
+# Define callbacks
+early_stopping = tf.keras.callbacks.EarlyStopping(
+    monitor='val_loss', patience=3, restore_best_weights=True
+)
+model_checkpoint = tf.keras.callbacks.ModelCheckpoint(
+    filepath='best_cnn_model.keras', monitor='val_loss', save_best_only=True
+)
+
+# Train model
+cnn_model.fit(
+    train_dataset,
+    validation_data=test_dataset,
+    epochs=20,
+    callbacks=[early_stopping, model_checkpoint]
+)
+
+# Save model
+cnn_model.save("mnist_cnn_model.keras")
+print("CNN model has been saved to 'mnist_cnn_model.keras'.")
