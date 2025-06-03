@@ -1,0 +1,155 @@
+import os
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, models
+import matplotlib.pyplot as plt
+
+# Train on a user-specified digit
+# Receive the digit to train on from the user
+user_digit = int(input("Enter the digit to train on (0-9): "))
+
+# Load and preprocess MNIST data
+(x_train, y_train), (_, _) = tf.keras.datasets.mnist.load_data()
+x_train = x_train[y_train == user_digit]  # Filter only the specified digit
+x_train = x_train / 255.0  # Normalize (scale pixel values to [0, 1])
+x_train = np.expand_dims(x_train, axis=-1)  # Add channel dimension (28x28 -> 28x28x1)
+
+BUFFER_SIZE = x_train.shape[0]  # Total data size
+BATCH_SIZE = min(256, BUFFER_SIZE)  # Batch size is 256 or the total data size, whichever is smaller
+
+# Create and optimize dataset
+dataset = (tf.data.Dataset.from_tensor_slices(x_train)
+           .shuffle(BUFFER_SIZE)  # Shuffle data
+           .batch(BATCH_SIZE)  # Split into batches
+           .prefetch(buffer_size=tf.data.AUTOTUNE))  # Optimize for parallel processing
+
+# Define the generator model
+def build_generator():
+    # Takes a noise vector (100-dimensional) as input and generates an image
+    return tf.keras.Sequential([
+        layers.Input(shape=(100,)),  # Input: 100-dimensional noise vector
+        layers.Dense(7 * 7 * 256, use_bias=False),  # Fully connected layer
+        layers.BatchNormalization(),  # Batch normalization
+        layers.LeakyReLU(),  # Activation function
+        layers.Reshape((7, 7, 256)),  # Reshape into a tensor
+        layers.Conv2DTranspose(128, (5, 5), strides=(1, 1), padding='same', use_bias=False),  # Upsampling
+        layers.BatchNormalization(),
+        layers.LeakyReLU(),
+        layers.Conv2DTranspose(64, (5, 5), strides=(2, 2), padding='same', use_bias=False),  # Upsampling
+        layers.BatchNormalization(),
+        layers.LeakyReLU(),
+        layers.Conv2DTranspose(1, (5, 5), strides=(2, 2), padding='same', use_bias=False, activation='tanh')  # Final output ([-1, 1] range)
+    ])
+
+# Define a simple discriminator (used in early training)
+def build_simple_discriminator():
+    # Takes an image as input and determines if it is real or fake
+    model = models.Sequential([
+        layers.Conv2D(32, (3, 3), activation='relu', input_shape=(28, 28, 1)),  # First convolutional layer
+        layers.MaxPooling2D((2, 2)),  # Downsampling
+        layers.Conv2D(64, (3, 3), activation='relu'),  # Second convolutional layer
+        layers.Flatten(),  # Flatten to a 1D vector
+        layers.Dense(64, activation='relu'),  # Fully connected layer
+        layers.Dense(1, activation='sigmoid')  # Output: real/fake classification
+    ])
+    return model
+
+# Define a strong CNN discriminator (used in later training stages)
+def build_strong_discriminator(user_digit):
+    # Load a pre-trained CNN model and create a discriminator specialized for the user-specified digit
+    base_model = models.load_model("mnist_cnn_model.keras")  # Load CNN model
+    base_model.trainable = False  # Freeze CNN weights
+
+    model = models.Sequential([
+        base_model,
+        layers.Lambda(lambda x: x[:, user_digit:user_digit+1]),  # Extract probability for the specific digit
+        layers.Dense(1, activation='sigmoid')  # Output: real/fake classification
+    ])
+    return model
+
+# Initialize models
+generator = build_generator()  # Initialize generator model
+discriminator = build_simple_discriminator()  # Initially use the simple discriminator
+
+# Loss functions and optimizers
+cross_entropy = tf.keras.losses.BinaryCrossentropy(from_logits=False)  # Binary cross-entropy
+generator_optimizer = tf.keras.optimizers.Adam(1e-4)  # Generator optimizer
+discriminator_optimizer = tf.keras.optimizers.Adam(1e-4)  # Discriminator optimizer
+
+# Define generator loss function
+def generator_loss(fake_output):
+    return cross_entropy(tf.ones_like(fake_output), fake_output)  # Train generator to make fake images classified as real (1)
+
+# Define discriminator loss function
+def discriminator_loss(real_output, fake_output):
+    real_loss = cross_entropy(tf.ones_like(real_output), real_output)  # Train discriminator to classify real images as real (1)
+    fake_loss = cross_entropy(tf.zeros_like(fake_output), fake_output)  # Train discriminator to classify fake images as fake (0)
+    return real_loss + fake_loss
+
+# Single training step
+@tf.function
+def train_step(images):
+    noise = tf.random.normal([BATCH_SIZE, 100])  # Generate noise
+    with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
+        generated_images = generator(noise, training=True)  # Generate images from generator
+
+        # Discriminator inputs
+        real_output = discriminator(images, training=True)  # Classify real images
+        fake_output = discriminator(generated_images, training=True)  # Classify generated images
+
+        gen_loss = generator_loss(fake_output)  # Calculate generator loss
+        disc_loss = discriminator_loss(real_output, fake_output)  # Calculate discriminator loss
+
+    # Compute and apply gradients
+    generator_gradients = gen_tape.gradient(gen_loss, generator.trainable_variables)
+    discriminator_gradients = disc_tape.gradient(disc_loss, discriminator.trainable_variables)
+    generator_optimizer.apply_gradients(zip(generator_gradients, generator.trainable_variables))
+    discriminator_optimizer.apply_gradients(zip(discriminator_gradients, discriminator.trainable_variables))
+
+    return gen_loss, disc_loss
+
+# Generate and save images
+def generate_and_save_images(model, epoch, test_input, save_dir="generated_images", user_digit=0):
+    save_dir = os.path.join(save_dir, str(user_digit))  # Set save directory
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    predictions = model(test_input, training=False)  # Generate images
+    predictions = (predictions + 1) / 2.0  # Convert [-1, 1] to [0, 1]
+    predictions = 1 - predictions  # Convert to white background with black digits
+
+    fig, axs = plt.subplots(4, 4, figsize=(6, 6))  # Display 16 images
+    for i, ax in enumerate(axs.flat):
+        ax.imshow(predictions[i, :, :, 0], cmap='gray')
+        ax.axis('off')
+    plt.suptitle(f"Epoch {epoch}", fontsize=16)
+    plt.savefig(f"{save_dir}/generated_epoch_{epoch:03d}.png")  # Save images
+    plt.close(fig)
+
+# Training function
+def train(dataset, epochs, user_digit):
+    steps_per_epoch = int(np.ceil(BUFFER_SIZE / BATCH_SIZE))  # Number of iterations per epoch
+    print(f"Steps per Epoch: {steps_per_epoch} | Total Samples: {BUFFER_SIZE}")
+
+    for epoch in range(epochs):
+        print(f"\nStarting Epoch {epoch + 1}/{epochs}")
+
+        # Switch discriminator after a specific epoch
+        if epoch == 50:
+            print("Switching Discriminator: Changing to strong CNN")
+            global discriminator
+            discriminator = build_strong_discriminator(user_digit)  # Switch to CNN-based discriminator
+            discriminator_optimizer.learning_rate = 1e-5  # Adjust learning rate
+
+        for step, image_batch in enumerate(dataset.take(steps_per_epoch)):
+            gen_loss, disc_loss = train_step(image_batch)  # Perform single training step
+            if step % 10 == 0:
+                print(f"  Step {step}/{steps_per_epoch}: Generator Loss = {gen_loss:.4f}, Discriminator Loss = {disc_loss:.4f}")
+
+        test_input = tf.random.normal([16, 100])  # Generate sample noise
+        generate_and_save_images(generator, epoch + 1, test_input, user_digit=user_digit)
+        print(f"Epoch {epoch + 1} completed\n")
+
+# Run training
+EPOCHS = 200  # Total number of epochs
+train(dataset, EPOCHS, user_digit)  # Start training
